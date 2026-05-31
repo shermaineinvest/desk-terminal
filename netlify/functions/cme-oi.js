@@ -1,6 +1,5 @@
-
 // netlify/functions/cme-oi.js
-const fetch = require('node-fetch');
+// Uses native fetch (Node 18+) - no dependencies needed
 
 const HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -9,118 +8,143 @@ const HEADERS = {
 };
 
 const CME_PRODUCTS = {
-  ES: { code: 'ES', name: 'E-Mini S&P 500', exchange: 'CME' },
-  YM: { code: 'YM', name: 'E-Mini Dow Jones', exchange: 'CBOT' },
-  NQ: { code: 'NQ', name: 'E-Mini Nasdaq 100', exchange: 'CME' },
-  GC: { code: 'GC', name: 'Gold Futures', exchange: 'COMEX' },
-  CL: { code: 'CL', name: 'Crude Oil WTI', exchange: 'NYMEX' },
-  DX: { code: 'DX', name: 'US Dollar Index', exchange: 'ICE' }
+  ES: { name: 'E-Mini S&P 500' },
+  YM: { name: 'E-Mini Dow Jones' },
+  NQ: { name: 'E-Mini Nasdaq 100' },
+  GC: { name: 'Gold Futures' },
+  CL: { name: 'Crude Oil WTI' },
+  DX: { name: 'US Dollar Index' }
 };
 
-async function fetchBarchartOI(symbol) {
+// Barchart continuous contract symbols (update quarterly)
+const BC_SYMS = {
+  ES: 'ESU25', YM: 'YMU25', NQ: 'NQU25',
+  GC: 'GCQ25', CL: 'CLN25', DX: 'DXU25'
+};
+
+async function fetchBarchart(symbol) {
   try {
-    const url = `https://www.barchart.com/proxies/core-api/v1/quotes/get?symbols=${symbol}&fields=symbol,lastPrice,priceChange,percentChange,openInterest,volume,tradeTime&groupBy=none&hasOptions=true&raw=1`;
+    const url = `https://www.barchart.com/proxies/core-api/v1/quotes/get?symbols=${symbol}&fields=symbol,lastPrice,openInterest,volume,tradeTime&raw=1`;
     const res = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; DESK-Terminal/6.0)',
+        'User-Agent': 'Mozilla/5.0 (compatible; DESK/6.0)',
         'Accept': 'application/json',
         'Referer': 'https://www.barchart.com'
-      }
+      },
+      signal: AbortSignal.timeout(8000)
     });
     if (!res.ok) return null;
     const data = await res.json();
-    const quote = data.data && data.data[0] && data.data[0].raw;
-    if (!quote) return null;
+    const q = data.data && data.data[0] && data.data[0].raw;
+    if (!q) return null;
     return {
-      symbol, openInterest: quote.openInterest || null,
-      volume: quote.volume || null, lastPrice: quote.lastPrice || null,
+      openInterest: q.openInterest || null,
+      volume: q.volume || null,
+      lastPrice: q.lastPrice || null,
       source: 'barchart'
     };
-  } catch (e) { return null; }
+  } catch(e) { return null; }
 }
 
-async function fetchCMEDirect(symbol) {
+async function fetchCME(sym) {
+  const ids = { ES: 4499, NQ: 4500, YM: 4488, GC: 437, CL: 425, DX: 4148 };
+  const id = ids[sym];
+  if (!id) return null;
   try {
-    const ids = { ES: 4499, NQ: 4500, YM: 4488, GC: 437, CL: 425, DX: 4148 };
-    const url = `https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/${ids[symbol]}/G?quoteCodes=null&_=1`;
+    const url = `https://www.cmegroup.com/CmeWS/mvc/Quotes/Future/${id}/G?quoteCodes=null`;
     const res = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; DESK-Terminal/6.0)',
+        'User-Agent': 'Mozilla/5.0 (compatible; DESK/6.0)',
         'Accept': 'application/json',
         'Referer': 'https://www.cmegroup.com'
-      }
+      },
+      signal: AbortSignal.timeout(8000)
     });
     if (!res.ok) return null;
     const data = await res.json();
-    const quote = data.quotes && data.quotes[0];
-    if (!quote) return null;
+    const q = data.quotes && data.quotes[0];
+    if (!q) return null;
     return {
-      symbol, openInterest: parseInt(quote.openInterest) || null,
-      volume: parseInt(quote.volume) || null,
-      lastPrice: parseFloat(quote.last) || null, source: 'cme'
+      openInterest: parseInt(q.openInterest) || null,
+      volume: parseInt(q.volume) || null,
+      lastPrice: parseFloat(q.last) || null,
+      source: 'cme'
     };
-  } catch (e) { return null; }
+  } catch(e) { return null; }
 }
 
-function interpretOI(symbol, oi, volume) {
-  const typicalOI = { ES: 2000000, YM: 120000, NQ: 500000, GC: 450000, CL: 1600000, DX: 50000 };
-  const ref = typicalOI[symbol];
-  if (!ref) return 'UNKNOWN';
-  const ratio = oi / ref;
-  if (ratio > 1.15) return 'ABOVE_AVERAGE';
-  if (ratio > 0.85) return 'AVERAGE';
+function interpretOI(sym, oi) {
+  const typical = { ES: 2000000, YM: 120000, NQ: 500000, GC: 450000, CL: 1600000, DX: 50000 };
+  const ref = typical[sym];
+  if (!ref || !oi) return 'UNKNOWN';
+  const r = oi / ref;
+  if (r > 1.15) return 'ABOVE_AVERAGE';
+  if (r > 0.85) return 'AVERAGE';
   return 'BELOW_AVERAGE';
 }
 
-function generateOIAnalysis(results) {
-  const signals = [], liquidityTraps = [], expanding = [], contracting = [];
+function analyse(results) {
+  const expanding = [], contracting = [], traps = [], signals = [];
   Object.keys(results).forEach(sym => {
     const d = results[sym];
     if (!d.openInterest) return;
-    if (d.volume && d.openInterest) {
-      const volOIRatio = d.volume / d.openInterest;
-      if (volOIRatio > 0.4 && d.oiSignal === 'BELOW_AVERAGE') {
-        liquidityTraps.push(sym);
-        signals.push(`${sym}: HIGH VOLUME + BELOW-AVG OI = POTENTIAL LIQUIDITY TRAP`);
+    if (d.oiSignal === 'ABOVE_AVERAGE') expanding.push(sym);
+    if (d.oiSignal === 'BELOW_AVERAGE') {
+      contracting.push(sym);
+      if (d.volume && (d.volume / d.openInterest) > 0.4) {
+        traps.push(sym);
+        signals.push(`${sym}: HIGH VOL + LOW OI = LIQUIDITY TRAP`);
       }
     }
-    if (d.oiSignal === 'ABOVE_AVERAGE') expanding.push(sym);
-    if (d.oiSignal === 'BELOW_AVERAGE') contracting.push(sym);
   });
   return {
-    expanding, contracting, liquidityTrapFlags: liquidityTraps, signals,
-    summary: signals.length > 0 ? signals.join(' | ')
-      : `OI normal: ${expanding.join(',') || 'none'} above avg; ${contracting.join(',') || 'none'} below avg`
+    expanding, contracting,
+    liquidityTrapFlags: traps,
+    signals,
+    summary: signals.length
+      ? signals.join(' | ')
+      : `OI normal. Expanding: ${expanding.join(',') || 'none'}. Contracting: ${contracting.join(',') || 'none'}.`
   };
 }
 
-exports.handler = async (event, context) => {
-  if (event.httpMethod === 'OPTIONS') return { statusCode: 200, headers: HEADERS, body: '' };
-  const results = {}, errors = [];
-  const bcSymMap = { ES: 'ESM25', YM: 'YMM25', NQ: 'NQM25', GC: 'GCM25', CL: 'CLM25', DX: 'DXM25' };
-  await Promise.all(['ES','YM','NQ','GC','CL','DX'].map(async (sym) => {
+export default async (req, context) => {
+  if (req.method === 'OPTIONS') {
+    return new Response('', { status: 200, headers: HEADERS });
+  }
+
+  const results = {};
+  const errors = [];
+
+  await Promise.all(Object.keys(CME_PRODUCTS).map(async sym => {
     try {
-      let data = await fetchBarchartOI(bcSymMap[sym]);
-      if (!data) data = await fetchCMEDirect(sym);
-      if (data) {
-        results[sym] = { ...data, productName: CME_PRODUCTS[sym].name,
-          oiSignal: data.openInterest > 0 ? interpretOI(sym, data.openInterest, data.volume) : 'NO_DATA',
-          fetchedAt: new Date().toISOString() };
+      let d = await fetchBarchart(BC_SYMS[sym]);
+      if (!d) d = await fetchCME(sym);
+      if (d) {
+        results[sym] = {
+          ...d,
+          symbol: sym,
+          productName: CME_PRODUCTS[sym].name,
+          oiSignal: interpretOI(sym, d.openInterest),
+          fetchedAt: new Date().toISOString()
+        };
       } else {
-        results[sym] = { symbol: sym, productName: CME_PRODUCTS[sym].name,
-          openInterest: null, volume: null, oiSignal: 'FETCH_FAILED',
-          fetchedAt: new Date().toISOString() };
+        results[sym] = { symbol: sym, openInterest: null, volume: null, oiSignal: 'FETCH_FAILED', fetchedAt: new Date().toISOString() };
         errors.push(sym);
       }
-    } catch (e) {
-      results[sym] = { symbol: sym, error: e.message, oiSignal: 'ERROR', fetchedAt: new Date().toISOString() };
+    } catch(e) {
+      results[sym] = { symbol: sym, oiSignal: 'ERROR', error: e.message, fetchedAt: new Date().toISOString() };
       errors.push(sym);
     }
   }));
-  return {
-    statusCode: 200, headers: HEADERS,
-    body: JSON.stringify({ success: true, timestamp: new Date().toISOString(),
-      data: results, analysis: generateOIAnalysis(results), errors,
-      note: errors.length > 0 ? `${errors.length} failed: ${errors.join(', ')}` : 'All fetched successfully' })
-  };
+
+  return new Response(JSON.stringify({
+    success: true,
+    timestamp: new Date().toISOString(),
+    data: results,
+    analysis: analyse(results),
+    errors,
+    note: errors.length ? `${errors.length} failed: ${errors.join(', ')}` : 'All fetched'
+  }), { status: 200, headers: HEADERS });
 };
+
+export const config = { path: '/api/cme-oi' };
