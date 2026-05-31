@@ -1,0 +1,8 @@
+{
+  "name": "desk-terminal",
+  "version": "6.0.0",
+  "description": "DESK Institutional Terminal - Netlify Functions Backend",
+  "dependencies": {
+    "node-fetch": "^2.6.9"
+  }
+}
