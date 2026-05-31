@@ -1,9 +1,5 @@
-
 // netlify/functions/proxy.js
-// Generic CORS proxy for financial data APIs that block browsers
-// Called as: /api/proxy?url=ENCODED_URL
-
-const fetch = require('node-fetch');
+// Generic CORS proxy - native fetch, no dependencies
 
 const HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -11,84 +7,46 @@ const HEADERS = {
   'Content-Type': 'application/json'
 };
 
-// Allowlist of domains we permit proxying (security)
-const ALLOWED_DOMAINS = [
-  'www.cmegroup.com',
-  'cmegroup.com',
-  'cdn.cboe.com',
-  'publicreporting.cftc.gov',
-  'fred.stlouisfed.org',
-  'ticdata.treasury.gov',
-  'www.barchart.com',
-  'query1.finance.yahoo.com',
-  'query2.finance.yahoo.com'
+const ALLOWED = [
+  'www.cmegroup.com', 'cmegroup.com',
+  'cdn.cboe.com', 'publicreporting.cftc.gov',
+  'fred.stlouisfed.org', 'www.barchart.com',
+  'query1.finance.yahoo.com', 'query2.finance.yahoo.com'
 ];
 
-exports.handler = async (event, context) => {
-  if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 200, headers: HEADERS, body: '' };
+export default async (req, context) => {
+  if (req.method === 'OPTIONS') return new Response('', { status: 200, headers: HEADERS });
+
+  const url = new URL(req.url);
+  const target = url.searchParams.get('url');
+  if (!target) return new Response(JSON.stringify({ error: 'Missing url' }), { status: 400, headers: HEADERS });
+
+  let parsed;
+  try { parsed = new URL(decodeURIComponent(target)); } catch(e) {
+    return new Response(JSON.stringify({ error: 'Invalid URL' }), { status: 400, headers: HEADERS });
   }
 
-  const targetUrl = event.queryStringParameters && event.queryStringParameters.url;
-  if (!targetUrl) {
-    return {
-      statusCode: 400,
-      headers: HEADERS,
-      body: JSON.stringify({ error: 'Missing url parameter' })
-    };
-  }
-
-  // Security: only allow whitelisted domains
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(decodeURIComponent(targetUrl));
-  } catch (e) {
-    return { statusCode: 400, headers: HEADERS, body: JSON.stringify({ error: 'Invalid URL' }) };
-  }
-
-  const domainAllowed = ALLOWED_DOMAINS.some(d => parsedUrl.hostname === d || parsedUrl.hostname.endsWith('.' + d));
-  if (!domainAllowed) {
-    return {
-      statusCode: 403,
-      headers: HEADERS,
-      body: JSON.stringify({ error: `Domain not allowed: ${parsedUrl.hostname}` })
-    };
-  }
+  const allowed = ALLOWED.some(d => parsed.hostname === d || parsed.hostname.endsWith('.' + d));
+  if (!allowed) return new Response(JSON.stringify({ error: 'Domain not allowed: ' + parsed.hostname }), { status: 403, headers: HEADERS });
 
   try {
-    const res = await fetch(decodeURIComponent(targetUrl), {
+    const res = await fetch(decodeURIComponent(target), {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; DESK-Terminal/6.0; Institutional Research Tool)',
+        'User-Agent': 'Mozilla/5.0 (compatible; DESK/6.0)',
         'Accept': 'application/json, text/csv, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': parsedUrl.origin
+        'Referer': parsed.origin
       },
-      timeout: 10000
+      signal: AbortSignal.timeout(10000)
     });
-
-    const contentType = res.headers.get('content-type') || '';
-    let body;
-    if (contentType.includes('application/json')) {
-      body = await res.json();
-      return {
-        statusCode: res.status,
-        headers: { ...HEADERS },
-        body: JSON.stringify(body)
-      };
-    } else {
-      // CSV, text, HTML
-      body = await res.text();
-      return {
-        statusCode: res.status,
-        headers: { ...HEADERS, 'Content-Type': 'text/plain' },
-        body: body
-      };
-    }
-  } catch (e) {
-    return {
-      statusCode: 502,
-      headers: HEADERS,
-      body: JSON.stringify({ error: 'Upstream fetch failed: ' + e.message })
-    };
+    const ct = res.headers.get('content-type') || '';
+    const body = ct.includes('json') ? await res.json() : await res.text();
+    return new Response(
+      typeof body === 'string' ? body : JSON.stringify(body),
+      { status: res.status, headers: { ...HEADERS, 'Content-Type': ct || 'text/plain' } }
+    );
+  } catch(e) {
+    return new Response(JSON.stringify({ error: e.message }), { status: 502, headers: HEADERS });
   }
 };
+
+export const config = { path: '/api/proxy' };
